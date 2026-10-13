@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Warehouse Control Tower</title>
+<script src="/vendor/chart.umd.js"></script>
+<style>
+  :root { --bg:#f5f6f8; --panel:#fff; --text:#1d2330; --muted:#6b7385; --line:#e3e6ec; --accent:#2f6fed; --good:#1f9d55; --warn:#d98b00; --bad:#d64545; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#12151b; --panel:#1b1f27; --text:#e7eaf0; --muted:#98a0b3; --line:#2b313d; --accent:#6c9bff; } }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.45 system-ui, sans-serif; background:var(--bg); color:var(--text); }
+  header { display:flex; flex-wrap:wrap; gap:12px; align-items:center; padding:12px 16px; background:var(--panel); border-bottom:1px solid var(--line); }
+  header h1 { font-size:17px; margin:0 12px 0 0; }
+  nav button { border:0; background:none; color:var(--muted); padding:6px 10px; border-radius:6px; cursor:pointer; font:inherit; }
+  nav button.on { background:var(--accent); color:#fff; }
+  .range { margin-left:auto; display:flex; gap:6px; align-items:center; color:var(--muted); }
+  input, textarea { font:inherit; color:var(--text); background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:5px 8px; }
+  .layout { display:grid; grid-template-columns: 1fr 380px; gap:16px; padding:16px; }
+  @media (max-width: 1000px) { .layout { grid-template-columns: 1fr; } }
+  .kpis { display:grid; grid-template-columns:repeat(auto-fill,minmax(170px,1fr)); gap:12px; margin-bottom:16px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  .kpi .label { color:var(--muted); font-size:12px; }
+  .kpi .val { font-size:24px; font-weight:600; margin-top:4px; }
+  .grid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); gap:16px; }
+  .card h3 { margin:0 0 10px; font-size:14px; }
+  canvas { max-height:280px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:500; }
+  td.n, th.n { text-align:right; font-variant-numeric:tabular-nums; }
+  .good { color:var(--good); } .warn { color:var(--warn); } .bad { color:var(--bad); }
+  .chat { display:flex; flex-direction:column; height:calc(100vh - 100px); position:sticky; top:16px; }
+  .msgs { flex:1; overflow:auto; display:flex; flex-direction:column; gap:10px; }
+  .msg { padding:10px 12px; border-radius:10px; white-space:pre-wrap; }
+  .msg.user { background:var(--accent); color:#fff; align-self:flex-end; max-width:85%; }
+  .msg.bot { background:var(--bg); }
+  .msg .tools { color:var(--muted); font-size:11px; margin-top:6px; }
+  .chat form { display:flex; gap:8px; margin-top:10px; }
+  .chat textarea { flex:1; resize:none; height:56px; }
+  .chat button { background:var(--accent); color:#fff; border:0; border-radius:6px; padding:0 14px; cursor:pointer; }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px; }
+  .chips button { border:1px solid var(--line); background:none; color:var(--text); border-radius:14px; padding:3px 10px; font-size:12px; cursor:pointer; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Warehouse Control Tower</h1>
+  <nav id="tabs"></nav>
+  <div class="range">From <input type="date" id="from" /> to <input type="date" id="to" /></div>
+</header>
+<div class="layout">
+  <main id="view"></main>
+  <aside class="card chat">
+    <h3>Ask the control tower</h3>
+    <div class="chips" id="chips"></div>
+    <div class="msgs" id="msgs"></div>
+    <form id="ask"><textarea id="q" placeholder="e.g. Why was caps attainment low yesterday?"></textarea><button>Send</button></form>
+  </aside>
+</div>
+<script>
+const TABS = ["Overview", "Inbound", "Outbound", "Inventory", "AFS", "Productivity"];
+let tab = "Overview";
+const charts = [];
+const fmt = (n) => (typeof n === "number" ? n.toLocaleString(undefined, { maximumFractionDigits: 2 }) : n ?? "-");
+const tone = (v, good, warn) => (v >= good ? "good" : v >= warn ? "warn" : "bad");
+const $ = (id) => document.getElementById(id);
+
+async function api(path) {
+  const p = new URLSearchParams();
+  if ($("from").value) p.set("from", $("from").value);
+  if ($("to").value) p.set("to", $("to").value);
+  const r = await fetch(`/api/${path}?${p}`);
+  return r.json();
+}
+const kpi = (label, val, cls = "") => `<div class="card kpi"><div class="label">${label}</div><div class="val ${cls}">${val}</div></div>`;
+const card = (title, body) => `<div class="card"><h3>${title}</h3>${body}</div>`;
+const canvas = (id) => `<canvas id="${id}"></canvas>`;
+function table(rows, cols) {
+  if (!rows.length) return "<p>No rows.</p>";
+  return `<table><tr>${cols.map(([k, l, n]) => `<th class="${n ? "n" : ""}">${l}</th>`).join("")}</tr>${rows.map((r) => `<tr>${cols.map(([k, , n]) => `<td class="${n ? "n" : ""}">${fmt(r[k])}</td>`).join("")}</tr>`).join("")}</table>`;
+}
+function chart(id, type, labels, datasets, opts = {}) {
+  charts.push(new Chart($(id), { type, data: { labels, datasets }, options: { responsive: true, maintainAspectRatio: true, plugins: { legend: { position: "bottom" } }, ...opts } }));
+}
+const color = ["#2f6fed", "#1f9d55", "#d98b00", "#d64545", "#7a5af8", "#0ea5a5"];
+
+const views = {
+  async Overview() {
+    const [o, ob] = await Promise.all([api("overview"), api("outbound")]);
+    return {
+      html: `<div class="kpis">
+        ${kpi("Caps attainment", o.caps_attainment_pct + "%", tone(o.caps_attainment_pct, 95, 88))}
+        ${kpi("Units shipped", fmt(o.units_shipped))}
+        ${kpi("Backlog (latest day)", fmt(o.backlog_units_latest))}
+        ${kpi("Units received", fmt(o.received_units))}
+        ${kpi("Receipt accuracy", o.receipt_accuracy_pct + "%", tone(o.receipt_accuracy_pct, 98, 95))}
+        ${kpi("Dock-to-stock", o.avg_dock_to_stock_hrs + " h", o.avg_dock_to_stock_hrs <= 12 ? "good" : "warn")}
+        ${kpi("Overall TPH", fmt(o.overall_tph))}
+        ${kpi("IPP (items/package)", fmt(o.ipp))}
+        ${kpi("On hand units", fmt(o.on_hand_units))}
+        ${kpi("AFS %", o.afs_pct + "%", tone(o.afs_pct, 85, 75))}
+        ${kpi("SKUs < 3 days cover", fmt(o.low_cover_skus), o.low_cover_skus > 20 ? "bad" : "warn")}
+        ${kpi("Storage utilisation", o.storage_utilization_pct + "%", o.storage_utilization_pct > 90 ? "bad" : "good")}
+      </div>${card("Caps vs actual shipped", canvas("c1"))}`,
+      draw() {
+        chart("c1", "bar", ob.by_day.map((d) => d.date.slice(5)), [
+          { label: "Caps", data: ob.by_day.map((d) => d.caps_units), backgroundColor: "#c9d6f5" },
+          { label: "Shipped", data: ob.by_day.map((d) => d.units_shipped), backgroundColor: color[0] },
+        ]);
+      },
+    };
+  },
+  async Inbound() {
+    const d = await api("inbound");
+    return {
+      html: `<div class="kpis">${kpi("ASNs", fmt(d.asns))}${kpi("Expected units", fmt(d.expected_units))}${kpi("Received units", fmt(d.received_units))}${kpi("Receipt accuracy", d.receipt_accuracy_pct + "%", tone(d.receipt_accuracy_pct, 98, 95))}${kpi("Late arrivals", d.late_arrival_pct + "%", d.late_arrival_pct > 15 ? "bad" : "good")}${kpi("Dock-to-stock", d.avg_dock_to_stock_hrs + " h")}</div>
+      <div class="grid2">${card("Expected vs received", canvas("c1"))}${card("Supplier performance", table(d.by_supplier, [["supplier", "Supplier"], ["asns", "ASNs", 1], ["fill_rate_pct", "Fill %", 1], ["late_arrival_pct", "Late %", 1]]))}</div>
+      <div style="margin-top:16px">${card("Open ASNs", table(d.open_asns, [["asn", "ASN"], ["supplier", "Supplier"], ["dock", "Dock"], ["status", "Status"], ["expected_units", "Expected", 1], ["received_units", "Received", 1]]))}</div>`,
+      draw() {
+        chart("c1", "line", d.by_day.map((x) => x.date.slice(5)), [
+          { label: "Expected", data: d.by_day.map((x) => x.expected_units), borderColor: color[2] },
+          { label: "Received", data: d.by_day.map((x) => x.received_units), borderColor: color[1] },
+        ]);
+      },
+    };
+  },
+  async Outbound() {
+    const d = await api("outbound");
+    return {
+      html: `<div class="kpis">${kpi("Caps", fmt(d.caps_units))}${kpi("Shipped", fmt(d.units_shipped))}${kpi("Attainment", d.caps_attainment_pct + "%", tone(d.caps_attainment_pct, 95, 88))}${kpi("Shipments", fmt(d.shipments))}${kpi("Backlog (latest)", fmt(d.backlog_units_latest))}${kpi("Missed cutoff orders", fmt(d.missed_cutoff_orders))}</div>
+      <div class="grid2">${card("Caps vs actual by day", canvas("c1"))}${card("Attainment % by day", canvas("c2"))}</div>
+      <div style="margin-top:16px">${card("By shift", table(d.by_shift, [["shift", "Shift"], ["caps_units", "Caps", 1], ["units_shipped", "Shipped", 1], ["caps_attainment_pct", "Attainment %", 1]]))}</div>`,
+      draw() {
+        const l = d.by_day.map((x) => x.date.slice(5));
+        chart("c1", "bar", l, [{ label: "Caps", data: d.by_day.map((x) => x.caps_units), backgroundColor: "#c9d6f5" }, { label: "Shipped", data: d.by_day.map((x) => x.units_shipped), backgroundColor: color[0] }]);
+        chart("c2", "line", l, [{ label: "Attainment %", data: d.by_day.map((x) => x.caps_attainment_pct), borderColor: color[1] }]);
+      },
+    };
+  },
+  async Inventory() {
+    const d = await api("inventory");
+    return {
+      html: `<div class="kpis">${kpi("SKUs", fmt(d.skus))}${kpi("On hand units", fmt(d.on_hand_units))}${kpi("Out-of-stock SKUs", fmt(d.out_of_stock_skus))}</div>
+      <div class="grid2">${card("Storage utilisation by zone", canvas("c1"))}${card("Stock by category", canvas("c2"))}</div>
+      <div style="margin-top:16px">${card("Storage areas", table(d.by_zone, [["zone", "Zone"], ["type", "Type"], ["bins", "Bins", 1], ["cbm", "CBM", 1], ["skus", "SKUs", 1], ["units", "Units", 1], ["bin_utilization_pct", "Bin util %", 1], ["cbm_utilization_pct", "CBM util %", 1]]))}</div>`,
+      draw() {
+        chart("c1", "bar", d.by_zone.map((z) => z.zone), [{ label: "Bin util %", data: d.by_zone.map((z) => z.bin_utilization_pct), backgroundColor: color[0] }, { label: "CBM util %", data: d.by_zone.map((z) => z.cbm_utilization_pct), backgroundColor: color[2] }], { scales: { y: { max: 100 } } });
+        chart("c2", "doughnut", d.by_category.map((c) => c.category), [{ data: d.by_category.map((c) => c.on_hand), backgroundColor: color }]);
+      },
+    };
+  },
+  async AFS() {
+    const d = await api("afs");
+    return {
+      html: `<div class="kpis">${kpi("AFS units", fmt(d.afs_units))}${kpi("AFS %", d.afs_pct + "%", tone(d.afs_pct, 85, 75))}${kpi("Reserved", fmt(d.reserved_units))}${kpi("Damaged", fmt(d.damaged_units))}${kpi("QC hold", fmt(d.qc_hold_units))}${kpi("Zero-AFS SKUs", fmt(d.zero_afs_skus))}</div>
+      <div class="grid2">${card("On hand breakdown", canvas("c1"))}${card(`SKUs under 3 days of cover (${d.low_cover_skus_count})`, table(d.low_cover_skus, [["sku", "SKU"], ["category", "Category"], ["afs", "AFS", 1], ["avg_daily_sales", "Avg/day", 1], ["days_of_cover", "Days cover", 1]]))}</div>`,
+      draw() {
+        chart("c1", "doughnut", ["AFS", "Reserved", "Damaged", "QC hold"], [{ data: [d.afs_units, d.reserved_units, d.damaged_units, d.qc_hold_units], backgroundColor: [color[1], color[0], color[3], color[2]] }]);
+      },
+    };
+  },
+  async Productivity() {
+    const d = await api("productivity");
+    const procs = ["receiving", "putaway", "picking", "packing", "sorting", "dispatch"];
+    return {
+      html: `<div class="kpis">${kpi("Overall TPH", fmt(d.overall_tph))}${kpi("IPP (items/package)", fmt(d.ipp))}${kpi("Units per pick", fmt(d.units_per_pick))}${kpi("Labor hours", fmt(d.total_labor_hours))}</div>
+      <div class="grid2">${card("TPH trend by process", canvas("c1"))}${card(`Hourly TPH (${d.to})`, canvas("c2"))}</div>
+      <div style="margin-top:16px">${card("TPH by process", table(d.by_process, [["process", "Process"], ["units", "Units", 1], ["labor_hours", "Labor hrs", 1], ["tph", "TPH", 1]]))}</div>`,
+      draw() {
+        const l = d.by_day.map((x) => x.date.slice(5));
+        chart("c1", "line", l, procs.map((p, i) => ({ label: p, data: d.by_day.map((x) => x[p]), borderColor: color[i] })));
+        chart("c2", "bar", d.by_hour_latest_day.map((h) => h.hour + ":00"), [{ label: "TPH", data: d.by_hour_latest_day.map((h) => h.tph), backgroundColor: color[0] }]);
+      },
+    };
+  },
+};
+
+async function render() {
+  $("tabs").innerHTML = TABS.map((t) => `<button class="${t === tab ? "on" : ""}" data-t="${t}">${t}</button>`).join("");
+  charts.splice(0).forEach((c) => c.destroy());
+  const v = await views[tab]();
+  $("view").innerHTML = v.html;
+  v.draw();
+}
+$("tabs").onclick = (e) => { if (e.target.dataset.t) { tab = e.target.dataset.t; render(); } };
+$("from").onchange = $("to").onchange = render;
+
+// Chat
+const history = [];
+const SAMPLES = ["Summarise today's operations", "Which shift has the worst caps attainment?", "Which SKUs will stock out soonest?", "Which zone is closest to full?", "Which supplier is late most often?"];
+$("chips").innerHTML = SAMPLES.map((s) => `<button type="button">${s}</button>`).join("");
+$("chips").onclick = (e) => { if (e.target.tagName === "BUTTON") send(e.target.textContent); };
+function addMsg(role, text, tools) {
+  const el = document.createElement("div");
+  el.className = `msg ${role}`;
+  el.textContent = text;
+  if (tools?.length) {
+    const t = document.createElement("div");
+    t.className = "tools";
+    t.textContent = "Data used: " + [...new Set(tools.map((x) => x.name))].join(", ");
+    el.appendChild(t);
+  }
+  $("msgs").appendChild(el);
+  $("msgs").scrollTop = 1e9;
+  return el;
+}
+async function send(text) {
+  if (!text.trim()) return;
+  addMsg("user", text);
+  history.push({ role: "user", content: text });
+  const pending = addMsg("bot", "Looking at the data...");
+  try {
+    const r = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messages: history }) });
+    const d = await r.json();
+    pending.remove();
+    if (d.error) { addMsg("bot", "Error: " + d.error); history.pop(); return; }
+    addMsg("bot", d.answer, d.toolCalls);
+    history.push({ role: "assistant", content: d.answer });
+  } catch (e) { pending.remove(); addMsg("bot", "Error: " + e.message); history.pop(); }
+}
+$("ask").onsubmit = (e) => { e.preventDefault(); const t = $("q").value; $("q").value = ""; send(t); };
+$("q").onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("ask").requestSubmit(); } };
+
+render();
+</script>
+</body>
+</html>
